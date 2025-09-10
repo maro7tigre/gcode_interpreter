@@ -1,29 +1,31 @@
 """
-The central coordinator that links the GUI to the core interpreter logic.
+This class acts as the main controller for the simulation, bridging the GUI
+and the interpreter backend.
 """
-from interpreters.linuxcnc_interpreter import LinuxCNCInterpreter
-from dialects.linuxcnc_dialect import LinuxCNCDialect
 
 class SimulationController:
     def __init__(self):
-        self.interpreter = LinuxCNCInterpreter(LinuxCNCDialect())
+        self.interpreter = None
+        self.gcode_lines = []
         self.canonical_commands = []
         self.errors = []
 
-    def load_gcode_file(self, file_path: str):
-        """Loads G-code from a file and returns the lines."""
+    def load_gcode_file(self, file_path):
         try:
             with open(file_path, 'r') as f:
-                gcode_lines = f.readlines()
-            return gcode_lines, None
+                return f.readlines(), None
         except Exception as e:
             return None, str(e)
 
     def run_simulation(self, gcode_lines):
-        """Runs the interpreter on the provided G-code lines."""
-        if not gcode_lines:
-            return False, "No G-code to simulate."
-
+        if not self.interpreter:
+            return False, "No interpreter selected."
+        
+        self.gcode_lines = gcode_lines
         self.canonical_commands, self.errors = self.interpreter.run_simulation(gcode_lines)
+        
+        if self.errors:
+            return False, self.errors[0] # Return the first error for simplicity
+        
         return True, None
 

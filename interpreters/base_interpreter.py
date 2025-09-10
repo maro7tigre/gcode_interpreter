@@ -1,135 +1,115 @@
 """
-The core G-code interpreter engine.
-
-This class is designed to be dialect-agnostic. It parses a line into a
-structured 'Block' and then uses the dialect's maps to dispatch to the
-correct handler function for each word.
+The base class for all G-code interpreters. This class provides the core
+parsing and execution loop, but the specific handlers for G- and M-codes
+are implemented in the dialect-specific subclasses.
 """
-import re
 from core.machine_state import MachineState
+from .parser import GCodeParser
 
 class Block:
-    """A Python representation of the 'block' struct."""
-    def __init__(self, line_num, text):
+    def __init__(self, line_num):
         self.line_number = line_num
-        self.text = text
-        self.g_modes = {}
-        self.m_modes = {}
-        self.params = {}
-        self.comment = ""
+        self.words = {}
+        # Initialize all possible word flags to False
+        for char_code in range(ord('a'), ord('z') + 1):
+            letter = chr(char_code)
+            setattr(self, f"{letter}_flag", False)
+            setattr(self, f"{letter}_number", 0.0)
 
-    def __getattr__(self, name):
-        # Dynamically create flag and number attributes
-        if name.endswith('_flag'):
-            key = name[:-5]
-            return key in self.params
-        if name.endswith('_number'):
-            key = name[:-7]
-            return self.params.get(key)
-        raise AttributeError(f"'Block' object has no attribute '{name}'")
-
+        # Special case for NUM arguments
+        self.er_flag = False; self.er_number = 0.0
+        self.eh_flag = False; self.eh_number = 0.0
+        self.ef_flag = False; self.ef_number = 0.0
 
 class BaseInterpreter:
     def __init__(self, dialect):
         self.dialect = dialect
         self.machine_state = MachineState()
+        self.parser = GCodeParser(self.machine_state)
         self.canon_commands = []
         self.errors = []
 
-    def parse_line(self, text, line_num):
-        """Replicates the logic of interp_read.cc."""
-        block = Block(line_num, text)
-
-        # Strip comments first
-        text = re.sub(r'\(.*?\)', '', text)
-        text = text.split(';')[0]
-        text = text.strip().lower()
-
-        pattern = re.compile(r'([a-zA-Z])([-+]?\d*\.?\d+)')
-
-        for match in pattern.finditer(text):
-            letter = match.group(1)
-            value = float(match.group(2))
-            block.params[letter] = value
-
-            if letter == 'g':
-                g_code_int = int(round(value * 10))
-                _, group = self.dialect.g_code_map.get(g_code_int, (None, -1))
-                if group != -1:
-                    block.g_modes[group] = g_code_int
-            elif letter == 'm':
-                m_code_int = int(round(value))
-                _, group = self.dialect.m_code_map.get(m_code_int, (None, -1))
-                if group != -1:
-                    block.m_modes[group] = m_code_int
-        return block
-
-    def enhance_block(self, block):
-        """Replicates logic from enhance_block in interp_internal.cc."""
-        has_axis_word = any(c in block.params for c in 'xyzabc')
-        if has_axis_word and 1 not in block.g_modes:
-             # If axes are present but no motion G-code, apply the last motion mode.
-            block.g_modes[1] = self.machine_state.active_g_codes.get(1, 0)
-        return True, None # Simplified error checking for now
-
     def run_simulation(self, gcode_lines):
-        """Main simulation loop."""
         self.machine_state.reset()
         self.canon_commands = []
         self.errors = []
-
-        for i, line in enumerate(gcode_lines):
-            block = self.parse_line(line, i + 1)
-            ok, err = self.enhance_block(block)
-            if not ok:
-                self.errors.append(f"Line {i+1}: {err}")
+        
+        line_num = 0
+        for line in gcode_lines:
+            line_num += 1
+            line = line.strip()
+            if not line or line.startswith('%'):
                 continue
             
-            ok, err = self.execute_block(block)
+            block = Block(line_num)
+            ok, error = self.parser.parse_line(line, block)
+
             if not ok:
-                self.errors.append(f"Line {i+1}: {err}")
+                self.errors.append(error)
+                return self.canon_commands, self.errors
+
+            # --- Enhance Block with implicit motion ---
+            has_axis_word = any(flag for name, flag in vars(block).items() if name.endswith('_flag') and name[0] in 'xyzabcuvw')
+            has_motion_code = False
+            for word in block.words:
+                if word.startswith('g') and self.dialect.g_code_map.get(int(float(word[1:]) * 10), (None, -1))[1] == 1:
+                    has_motion_code = True
+                    break
+            
+            if has_axis_word and not has_motion_code:
+                block.words[self.machine_state.motion_mode.lower()] = 0 # Dummy value to trigger motion handler
+
+            self.execute_block(block)
+            if self.errors:
+                return self.canon_commands, self.errors
 
         return self.canon_commands, self.errors
 
     def execute_block(self, block):
-        """
-        Executes a parsed block in the correct order of operations,
-        replicating the logic from interp_execute.cc.
-        """
-        # This order is critical
-        execution_order = [
-            (5, self.dialect.g_code_map),  # Feed Mode
-            ('s', None),                  # Spindle Speed
-            ('t', None),                  # Tool Select
-            (8, self.dialect.m_code_map),  # Coolant
-            (7, self.dialect.m_code_map),  # Spindle Control
-            (6, self.dialect.m_code_map),  # Tool Change
-            (2, self.dialect.g_code_map),  # Plane
-            (6, self.dialect.g_code_map),  # Units
-            (7, self.dialect.g_code_map),  # Cutter Comp
-            (8, self.dialect.g_code_map),  # Tool Length Offset
-            (12, self.dialect.g_code_map), # Coordinate System
-            (3, self.dialect.g_code_map),  # Distance Mode
-            (10, self.dialect.g_code_map), # Retract Mode
-            (0, self.dialect.g_code_map),  # Non-Modal G-Codes
-            (1, self.dialect.g_code_map),  # Motion
-            (4, self.dialect.m_code_map),  # Stopping
-        ]
-
-        for key, code_map in execution_order:
-            if isinstance(key, int): # Modal group
-                if key in block.g_modes and code_map is self.dialect.g_code_map:
-                    code = block.g_modes[key]
-                    handler_name, _ = code_map[code]
-                    getattr(self, handler_name)(block)
-                elif key in block.m_modes and code_map is self.dialect.m_code_map:
-                    code = block.m_modes[key]
-                    handler_name, _ = code_map[code]
-                    getattr(self, handler_name)(block)
-            else: # Single word like 's' or 't'
-                if f"{key}_flag" in block.params:
-                     # Simplified handler dispatch for single words
-                    if key == 's': self._handle_spindle_speed(block)
-                    if key == 't': self._handle_tool_select(block)
+        # Strict order of execution based on industrial controller logic
         
-        return True, None
+        # Stage 1: Set state (non-motion G-codes)
+        self._execute_g_codes_by_group(block, [2, 3, 5, 6, 7, 8, 12, 14]) # Plane, Distance, Feed, Units, Comp, Tool Length, CS
+        
+        # Stage 2: M-Codes and other settings
+        self._execute_m_codes_by_group(block, [7, 8, 9]) # Spindle, Coolant, Overrides
+        if block.f_flag: self.machine_state.feed_rate = block.f_number
+        if block.s_flag: self.machine_state.spindle_speed = block.s_number
+        if block.t_flag: self.machine_state.selected_tool = block.t_number
+
+        # Stage 3: Tool Change
+        self._execute_m_codes_by_group(block, [6])
+
+        # Stage 4: Motion
+        self._execute_g_codes_by_group(block, [1, 0]) # Motion, Non-modal
+        
+        # Stage 5: Program Stop/End
+        self._execute_m_codes_by_group(block, [4])
+
+    def _execute_g_codes_by_group(self, block, groups):
+        for g_word, g_val in block.words.items():
+            if g_word.startswith('g'):
+                if not g_word[1:]: continue # Handle bare 'g'
+                try:
+                    g_code_int = int(float(g_word[1:]) * 10)
+                except ValueError:
+                    self.errors.append(f"Invalid G-code format on line {block.line_number}: {g_word}")
+                    return
+
+                handler_name, group = self.dialect.g_code_map.get(g_code_int, (None, -1))
+                if group in groups and hasattr(self, handler_name):
+                    getattr(self, handler_name)(block)
+
+    def _execute_m_codes_by_group(self, block, groups):
+        for m_word, m_val in block.words.items():
+            if m_word.startswith('m'):
+                if not m_word[1:]: continue
+                try:
+                    m_code_int = int(float(m_word[1:]))
+                except ValueError:
+                    self.errors.append(f"Invalid M-code format on line {block.line_number}: {m_word}")
+                    return
+
+                handler_name, group = self.dialect.m_code_map.get(m_code_int, (None, -1))
+                if group in groups and hasattr(self, handler_name):
+                    getattr(self, handler_name)(block)

@@ -1,114 +1,76 @@
-"""
-Concrete implementation of the interpreter for the LinuxCNC dialect.
-
-This class inherits from the BaseInterpreter and provides the Python
-implementations for all the G-code and M-code handler functions. The logic
-is ported from the various interp_*.cc files.
-"""
 from .base_interpreter import BaseInterpreter
 from core.canonical import *
 from utils.geometry import calculate_arc_data_r, calculate_arc_data_ijk
 
 class LinuxCNCInterpreter(BaseInterpreter):
+    # This class inherits all the advanced parsing and execution logic
+    # from the new BaseInterpreter. We only need to add LinuxCNC-specific
+    # handlers here.
 
     def _get_target_position(self, block):
+        # Apply offsets to get absolute position in machine coordinates
+        offset = self.machine_state.get_offset()
+        current_abs = {axis: self.machine_state.current_pos[axis] + offset[axis] for axis in 'xyz'}
+        
         target = self.machine_state.get_position()
-        is_incremental = self.machine_state.distance_mode == 910
-
-        for axis in 'xyzabc':
-            if getattr(block, f"{axis}_flag"):
-                if is_incremental:
-                    target[axis] += getattr(block, f"{axis}_number")
-                else:
-                    target[axis] = getattr(block, f"{axis}_number")
+        
+        if self.machine_state.distance_mode == 'absolute':
+            if block.x_flag: target['x'] = block.x_number - offset['x']
+            if block.y_flag: target['y'] = block.y_number - offset['y']
+            if block.z_flag: target['z'] = block.z_number - offset['z']
+        else: # Incremental
+            if block.x_flag: target['x'] += block.x_number
+            if block.y_flag: target['y'] += block.y_number
+            if block.z_flag: target['z'] += block.z_number
         return target
-
-    # --- Motion Handlers (from interp_convert.cc & interp_arc.cc) ---
+        
     def _handle_rapid_move(self, block):
         target = self._get_target_position(block)
-        self.canon_commands.append(RapidMove(block.line_number, self.machine_state.get_position(), target))
+        command = RapidMove(block.line_number, self.machine_state.get_position(), target)
+        self.canon_commands.append(command)
         self.machine_state.set_position(target)
 
     def _handle_linear_feed(self, block):
         target = self._get_target_position(block)
-        self.canon_commands.append(LinearFeed(block.line_number, self.machine_state.get_position(), target))
+        command = LinearFeed(block.line_number, self.machine_state.get_position(), target)
+        self.canon_commands.append(command)
         self.machine_state.set_position(target)
-
-    def _handle_arc_feed(self, block):
+        
+    def _handle_arc_feed(self, block, direction):
         target = self._get_target_position(block)
         start_pos = self.machine_state.get_position()
-        arc_g_code = block.g_modes.get(1)
-
+        
         if block.r_flag:
-            center_x, center_y, turns = calculate_arc_data_r(
-                arc_g_code, start_pos['x'], start_pos['y'], target['x'], target['y'], block.r_number
-            )
+             center_x, center_y, _ = calculate_arc_data_r(direction, start_pos['x'], start_pos['y'], target['x'], target['y'], block.r_number)
         else:
-            center_x, center_y, turns = calculate_arc_data_ijk(
-                arc_g_code, start_pos['x'], start_pos['y'], target['x'], target['y'],
-                block.i_number or 0, block.j_number or 0, block.k_number or 0, self.machine_state.plane
-            )
+             center_x, center_y, _ = calculate_arc_data_ijk(direction, start_pos['x'], start_pos['y'], target['x'], target['y'], block.i_number, block.j_number)
 
-        self.canon_commands.append(ArcFeed(block.line_number, start_pos, target, {'x': center_x, 'y': center_y, 'z': 0}, turns))
+        command = ArcFeed(block.line_number, start_pos, target, {'x': center_x, 'y': center_y}, direction)
+        self.canon_commands.append(command)
         self.machine_state.set_position(target)
 
-    # --- Canned Cycle Handlers (from interp_cycles.cc) ---
-    def _handle_cycle_g81(self, block):
-        target = self._get_target_position(block)
-        r_plane = block.r_number
-        start_pos = self.machine_state.get_position()
+    def _handle_arc_feed_cw(self, block): self._handle_arc_feed(block, -1)
+    def _handle_arc_feed_ccw(self, block): self._handle_arc_feed(block, 1)
 
-        pos1 = {'x': target['x'], 'y': target['y'], 'z': start_pos['z']}
-        pos2 = {'x': target['x'], 'y': target['y'], 'z': r_plane}
-        pos3 = {'x': target['x'], 'y': target['y'], 'z': target['z']}
-        
-        self.canon_commands.append(RapidMove(block.line_number, start_pos, pos1))
-        self.canon_commands.append(RapidMove(block.line_number, pos1, pos2))
-        self.canon_commands.append(LinearFeed(block.line_number, pos2, pos3))
-        self.canon_commands.append(RapidMove(block.line_number, pos3, pos2))
-        
-        self.machine_state.set_position(pos2)
-
-    def _handle_cancel_cycle(self, block):
-        self.machine_state.active_g_codes[1] = 800
-
-    # ... other G8x cycle handlers would follow a similar pattern ...
-
-    # --- G-Code Handlers (Modal Group 0) ---
-    def _handle_dwell(self, block):
-        self.canon_commands.append(Dwell(block.line_number, block.p_number))
-    
-    # --- M-Code Handlers ---
-    def _handle_program_end(self, block):
-        self.canon_commands.append(ProgramEnd(block.line_number))
-        self._handle_spindle_off(block)
-        self._handle_coolant_off(block)
+    def _handle_absolute_mode(self, block): self.machine_state.distance_mode = 'absolute'
+    def _handle_incremental_mode(self, block): self.machine_state.distance_mode = 'incremental'
 
     def _handle_spindle_clockwise(self, block):
-        self.canon_commands.append(SpindleControl(block.line_number, 'CW'))
-    
-    def _handle_spindle_counterclockwise(self, block):
-        self.canon_commands.append(SpindleControl(block.line_number, 'CCW'))
+        self.canon_commands.append(SpindleControl(block.line_number, 'cw', self.machine_state.spindle_speed))
 
     def _handle_spindle_off(self, block):
-        self.canon_commands.append(SpindleControl(block.line_number, 'OFF'))
+        self.canon_commands.append(SpindleControl(block.line_number, 'off'))
+        
+    def _handle_tool_change(self, block):
+        self.canon_commands.append(ToolChange(block.line_number, self.machine_state.selected_tool))
 
-    def _handle_mist_on(self, block):
-        self.canon_commands.append(CoolantControl(block.line_number, 'MIST', True))
-
-    def _handle_flood_on(self, block):
-        self.canon_commands.append(CoolantControl(block.line_number, 'FLOOD', True))
-
-    def _handle_coolant_off(self, block):
-        self.canon_commands.append(CoolantControl(block.line_number, 'MIST', False))
-        self.canon_commands.append(CoolantControl(block.line_number, 'FLOOD', False))
-
-    # --- Placeholder Handlers for other codes ---
+    def _handle_program_end(self, block):
+        self.canon_commands.append(ProgramEnd(block.line_number))
+        
     def __getattr__(self, name):
-        """Catch-all for unimplemented handlers."""
         if name.startswith('_handle_'):
-            def placeholder(block):
-                # print(f"Warning: Handler '{name}' for block '{block.text.strip()}' is not implemented.")
-                pass
-            return placeholder
+            def dummy_handler(block):
+                print(f"Warning: Handler for {name} on line {block.line_number} is not implemented.")
+            return dummy_handler
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
